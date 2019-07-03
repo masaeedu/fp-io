@@ -1,0 +1,19 @@
+{
+  "name": "@masaeedu/fp-io",
+  "version": "0.0.1",
+  "main": "index.js",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@masaeedu/adt": "^1.1.0",
+    "@masaeedu/do": "^0.2.1",
+    "@masaeedu/fp": "^10.1.0",
+    "request": "^2.88.0",
+    "tempy": "^0.3.0"
+  },
+  "devDependencies": {
+    "ava": "^2.1.0"
+  }
+}

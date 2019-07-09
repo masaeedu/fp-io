@@ -1,11 +1,22 @@
 const fs = require("fs");
 const stream = require("stream");
-
+const process = require("child_process");
 const https = require("https");
+
 const tempy = require("tempy");
 
 const { mdo } = require("@masaeedu/do");
-const { Fn, Obj, Arr, Str, Either, EitherT, Cont } = require("@masaeedu/fp");
+const { adt, match } = require("@masaeedu/adt");
+const {
+  Fn,
+  Obj,
+  Arr,
+  Str,
+  Either,
+  EitherT,
+  Cont,
+  Kleisli
+} = require("@masaeedu/fp");
 
 const { Readable } = stream;
 const { Left, Right } = Either;
@@ -128,12 +139,21 @@ const HTTPS = (() => {
       ]);
   };
 
-  // :: RequestOptions -> ECont! Response
-  const get = opts => {
-    const emptyBody = ECont.lift(RStream.empty);
-    const rwb = Fn.flip(requestWithBody)(opts);
-    return ECont[">>="](emptyBody)(rwb);
-  };
+  const raw = (() => {
+    // :: RequestOptions -> ECont! Response
+    const get = opts => {
+      const emptyBody = ECont.lift(RStream.empty);
+      const rwb = Fn.flip(requestWithBody)(opts);
+      return ECont[">>="](emptyBody)(rwb);
+    };
+
+    return { get };
+  })();
+
+  const get = Fn.passthru(raw.get)([
+    followRedirects,
+    Kleisli(ECont)["<:"](validateCode)
+  ]);
 
   // :: Response -> ECont! JSON
   const readJSONBody = Fn.pipe([
@@ -141,14 +161,23 @@ const HTTPS = (() => {
     Cont.map(Either["=<<"](JS0N.parse))
   ]);
 
+  const download = location => url =>
+    mdo(ECont)(({ res, ws }) => [
+      [res, () => get(url)],
+      [ws, () => ECont.lift(FS.createWriteStream(location))],
+      () => RStream.pipe(res)(ws)
+    ]);
+
   return {
     makeRequest,
     awaitResponse,
     followRedirects,
     validateCode,
     requestWithBody,
+    raw,
     get,
-    readJSONBody
+    readJSONBody,
+    download
   };
 })();
 
@@ -168,7 +197,71 @@ const FS = (() => {
   const copyFile = source => dest => cb =>
     fs.copyFile(source, dest, err => cb(err ? Left(err) : Right()));
 
-  return { createWriteStream, createReadStream, tempFilePath, copyFile };
+  // :: FilePath -> ECont! ()
+  const mkdir = path => cb =>
+    fs.mkdir(path, { recursive: true }, e => cb(e ? Left(e) : Right()));
+
+  return { createWriteStream, createReadStream, tempFilePath, copyFile, mkdir };
 })();
 
-module.exports = { RStream, HTTPS, FS };
+const Prc = (() => {
+  const Fate = adt({ Exited: ["Int"], Killed: ["String"] });
+  const { Exited, Killed } = Fate;
+
+  // :: ChildProcess -> Cont! Fate
+  const waitFor = p => cb =>
+    p.on("exit", (code, signal) =>
+      code !== null ? cb(Exited(code)) : cb(Killed(signal))
+    );
+
+  // :: MonadError Error m -> Fate -> m ()
+  const validateFate = M => {
+    const nonzero = code =>
+      M.fail(new Error(`Process exited with non-zero exit code: ${code}`));
+
+    const killed = signal =>
+      M.fail(new Error(`Process was killed with signal: ${signal}`));
+
+    return match({
+      Exited: c => (c === 0 ? M.of() : nonzero(c)),
+      Killed: killed
+    });
+  };
+
+  // :: type SpawnConfiguration = ... // TODO: Fill this out
+  // :: type SpawnOptions = { command: String, args: String[], options: SpawnConfiguration }
+
+  // :: SpawnOptions -> ECont! ChildProcess
+  const spawn = ({ command, args, options }) => cb => {
+    try {
+      const p = process.spawn(command, args, options);
+
+      if (p.pid === undefined) {
+        p.on("error", e => cb(Left(e)));
+      } else {
+        cb(Right(p));
+      }
+    } catch (e) {
+      return cb(Left(e));
+    }
+  };
+
+  // :: ChildProcess -> ECont! ()
+  const ensureSuccess = Kleisli(ECont).pipe([
+    Fn["<:"](ECont.lift)(waitFor),
+    validateFate(ECont)
+  ]);
+
+  // :: ChildProcess -> ECont! { stdout: String, stderr: String }
+  const gather = p => {
+    const { stdout, stderr } = p;
+    const fold = RStream.fold(Str);
+    const combine = stdout => stderr => ({ stdout, stderr });
+
+    return Cont.Par.lift2(Either.lift2(combine))(fold(stdout))(fold(stderr));
+  };
+
+  return { spawn, Fate, waitFor, validateFate, ensureSuccess, gather };
+})();
+
+module.exports = { RStream, HTTPS, FS, Prc };

@@ -12,15 +12,39 @@ const {
   Obj,
   Arr,
   Str,
+  Maybe,
   Either,
   EitherT,
   Cont,
-  Kleisli
+  Kleisli,
+  Fnctr,
+  implement,
+  Functor,
+  Apply
 } = require("@masaeedu/fp");
 
 const { Readable } = stream;
 const { Left, Right } = Either;
+const { Just, Nothing } = Maybe;
 const ECont = EitherT(Cont);
+const EPCont = Fn.passthru(Fnctr.append(Cont.Par)(Either))([
+  implement(Functor),
+  implement(Apply)
+]);
+
+const OS = (() => {
+  const Distro = adt({ Windows: [], Linux: [] });
+  const { Windows, Linux } = Distro;
+
+  // :: { username: String } -> Distro -> FilePath
+  const tmpdir = ({ username }) =>
+    match({
+      Linux: "/tmp",
+      Windows: `C:/Users/${username}/AppData/Local/Temp`
+    });
+
+  return { Distro, Windows, Linux, tmpdir };
+})();
 
 const RStream = (() => {
   // :: Monoid m -> RStream m -> ECont! m
@@ -161,7 +185,7 @@ const HTTPS = (() => {
     Cont.map(Either["=<<"](JS0N.parse))
   ]);
 
-  const download = location => url =>
+  const download = ({ location, url }) =>
     mdo(ECont)(({ res, ws }) => [
       [res, () => get(url)],
       [ws, () => ECont.lift(FS.createWriteStream(location))],
@@ -197,14 +221,68 @@ const FS = (() => {
   const copyFile = source => dest => cb =>
     fs.copyFile(source, dest, err => cb(err ? Left(err) : Right()));
 
+  const cp = copyFile;
+
   // :: FilePath -> ECont! ()
   const mkdir = path => cb =>
     fs.mkdir(path, { recursive: true }, e => cb(e ? Left(e) : Right()));
 
-  return { createWriteStream, createReadStream, tempFilePath, copyFile, mkdir };
+  // :: FilePath -> ECont! [FilePath]
+  const readdir = path => cb =>
+    fs.readdir(path, (e, results) => cb(e ? Left(e) : Right(results)));
+
+  const ls = readdir;
+
+  // :: (String | Buffer) -> FilePath -> ECont! ()
+  const writeToFile = str => target =>
+    mdo(ECont)(({ rs, ws }) => [
+      [rs, () => ECont.lift(RStream.create(str))],
+      [ws, () => ECont.lift(FS.createWriteStream(target))],
+      () => RStream.pipe(rs)(ws)
+    ]);
+
+  return {
+    createWriteStream,
+    createReadStream,
+    tempFilePath,
+    copyFile,
+    cp,
+    mkdir,
+    readdir,
+    ls,
+    writeToFile
+  };
+})();
+
+const Cnsl = (() => {
+  const log = s => cb => {
+    console.log(s);
+    cb();
+  };
+
+  return { log };
 })();
 
 const Prc = (() => {
+  // :: type SpawnConfiguration = ... // TODO: Fill this out
+  // :: type SpawnOptions = { command: String, args: String[], options: SpawnConfiguration }
+
+  // :: SpawnOptions -> ECont! ChildProcess
+  const spawn = ({ command, args, options }) => cb => {
+    let p = undefined;
+    try {
+      p = process.spawn(command, args, options);
+    } catch (e) {
+      return cb(Left(e));
+    }
+
+    if (p.pid === undefined) {
+      p.on("error", e => cb(Left(e)));
+    } else {
+      cb(Right(p));
+    }
+  };
+
   const Fate = adt({ Exited: ["Int"], Killed: ["String"] });
   const { Exited, Killed } = Fate;
 
@@ -214,54 +292,65 @@ const Prc = (() => {
       code !== null ? cb(Exited(code)) : cb(Killed(signal))
     );
 
-  // :: MonadError Error m -> Fate -> m ()
-  const validateFate = M => {
+  // :: type ProcessResult = { stdout: String, stderr: String, fate: Fate }
+
+  // :: RStream String -> ECont! String
+  const foldStr = RStream.fold(Str);
+
+  // :: ChildProcess -> ECont! ProcessResult
+  const gather = p =>
+    Obj.sequence(EPCont)({
+      process: ECont.of(p),
+      stdout: foldStr(p.stdout),
+      stderr: foldStr(p.stderr),
+      fate: ECont.lift(waitFor(p))
+    });
+
+  // :: ProcessResult -> Maybe Error
+  const scrutinize = (() => {
     const nonzero = code =>
-      M.fail(new Error(`Process exited with non-zero exit code: ${code}`));
+      Just(new Error(`Process exited with non-zero exit code: ${code}`));
 
     const killed = signal =>
-      M.fail(new Error(`Process was killed with signal: ${signal}`));
+      Just(new Error(`Process was killed with signal: ${signal}`));
 
-    return match({
-      Exited: c => (c === 0 ? M.of() : nonzero(c)),
-      Killed: killed
+    return ({ fate }) =>
+      Fn.flip(match)(fate)({
+        Exited: c => (c === 0 ? Nothing : nonzero(c)),
+        Killed: killed
+      });
+  })();
+
+  // :: ProcessResult -> ECont! ()
+  const ensureSuccess = r =>
+    Fn.flip(match)(scrutinize(r))({
+      Nothing: ECont.of(),
+      Just: error => ECont.fail({ ...r, error })
     });
+
+  // :: RStream Buffer -> SpawnOptions -> ECont! ProcessResult
+  const runWithStdin = stdin => opts =>
+    mdo(ECont)(({ p, o }) => [
+      [p, () => spawn(opts)],
+      () => RStream.pipe(stdin)(p.stdin),
+      [o, () => gather(p)],
+      () => ensureSuccess(o),
+      () => ECont.of(o)
+    ]);
+
+  // :: SpawnOptions -> ECont! ProcessResult
+  const run = runWithStdin(RStream.empty);
+
+  return {
+    spawn,
+    Fate,
+    waitFor,
+    gather,
+    scrutinize,
+    ensureSuccess,
+    run,
+    runWithStdin
   };
-
-  // :: type SpawnConfiguration = ... // TODO: Fill this out
-  // :: type SpawnOptions = { command: String, args: String[], options: SpawnConfiguration }
-
-  // :: SpawnOptions -> ECont! ChildProcess
-  const spawn = ({ command, args, options }) => cb => {
-    try {
-      const p = process.spawn(command, args, options);
-
-      if (p.pid === undefined) {
-        p.on("error", e => cb(Left(e)));
-      } else {
-        cb(Right(p));
-      }
-    } catch (e) {
-      return cb(Left(e));
-    }
-  };
-
-  // :: ChildProcess -> ECont! ()
-  const ensureSuccess = Kleisli(ECont).pipe([
-    Fn["<:"](ECont.lift)(waitFor),
-    validateFate(ECont)
-  ]);
-
-  // :: ChildProcess -> ECont! { stdout: String, stderr: String }
-  const gather = p => {
-    const { stdout, stderr } = p;
-    const fold = RStream.fold(Str);
-    const combine = stdout => stderr => ({ stdout, stderr });
-
-    return Cont.Par.lift2(Either.lift2(combine))(fold(stdout))(fold(stderr));
-  };
-
-  return { spawn, Fate, waitFor, validateFate, ensureSuccess, gather };
 })();
 
-module.exports = { RStream, HTTPS, FS, Prc };
+module.exports = { OS, RStream, HTTPS, FS, Cnsl, Prc };

@@ -3,7 +3,7 @@ const test = require("ava");
 const { match } = require("@masaeedu/adt");
 const { mdo } = require("@masaeedu/do");
 
-const { RStream, FS, HTTPS } = require("..");
+const { RStream, FS, HTTPS, Prc } = require("..");
 const { Fn, Kleisli, Either, EitherT, Cont, Str } = require("@masaeedu/fp");
 
 const ECont = EitherT(Cont);
@@ -45,5 +45,15 @@ test.cb("streams interact properly", t => {
     [content, () => ECont.lift(FS.createReadStream(path))],
     () => RStream.fold(Str)(content)
   ]);
+  main(snap(t));
+});
+
+test.cb("passing stdin works", t => {
+  const main = mdo(ECont)(({ stdin, result }) => [
+    [stdin, () => ECont.lift(RStream.create(`echo "Hello, World!"`))],
+    [result, () => Prc.runWithStdin(stdin)({ command: "bash" })],
+    () => ECont.of(result.stdout)
+  ]);
+
   main(snap(t));
 });

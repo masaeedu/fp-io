@@ -339,7 +339,8 @@ const Prc = (() => {
     ]);
 
   // :: SpawnOptions -> ECont! ProcessResult
-  const run = runWithStdin(RStream.empty);
+  const run = opts =>
+    ECont[">>="](ECont.lift(RStream.empty))(Fn.flip(runWithStdin)(opts));
 
   return {
     spawn,
